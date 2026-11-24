@@ -1,0 +1,156 @@
+import base64
+from datetime import datetime
+import json
+import os
+import uuid
+from flask import (
+    Flask,
+    jsonify,
+    render_template_string,
+    request,
+    send_from_directory,
+    session,
+)
+import requests
+from werkzeug.utils import secure_filename
+
+# Anahtarların başındaki harfleri küçük 'gsk_' olarak düzelttim Reis
+GROQ_API_KEYS = [
+    "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",
+    "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",
+]
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24))
+
+UPLOAD_FOLDER = os.path.abspath("uploads")
+CHATS_FOLDER = os.path.abspath("chats")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(CHATS_FOLDER, exist_ok=True)
+
+user_sessions = {}
+
+
+def get_system_persona():
+  now_str = datetime.now().strftime("%d.%m.%Y saat %H:%M")
+  return (
+      f"Sen Muhammet Ali'nin en yakın mahalle kankası ve dostusun. Tarih:"
+      f" {now_str}. KESİNLİKLE sadece Türkçe konuş. Asla İngilizce, asla resmi"
+      ' konuşma! Asla "canım", "bebeğim", "tatlım", "sevgilim", "hayatım" gibi'
+      ' laflar KULLANMA! Erkekçe, delikanlıca, samimi tam mahalle kankası ağzıyla'
+      " konuş. Kullanıcı fotoğraf gönderdiyse fotoğrafı çok dikkatli incele ve"
+      " ne olduğunu kanka tarzında anlat. Sadece kullanıcının söylediğini"
+      " tekrarlama! Cevapların kısa, net ve doğal olsun. Her cümlenin sonunda"
+      " KESİNLİKLE 'Reis' kelimesini kullan."
+  )
+
+
+def ask_ai_engine(user_id, prompt_text, image_data=None):
+  if user_id not in user_sessions:
+    user_sessions[user_id] = []
+
+  history_list = user_sessions[user_id]
+  messages = [{"role": "system", "content": get_system_persona()}]
+
+  if history_list:
+    for h in history_list[-10:]:  # Son 10 mesajı tut ki şişme yapmasın
+      role = "user" if h.get("sender") == "user" else "assistant"
+      clean_text = h.get("text", "").split("<br>")[0]
+      if clean_text and clean_text != "[Görsel Gönderildi]":
+        messages.append({"role": role, "content": clean_text})
+
+  url = "https://api.groq.com/openai/v1/chat/completions"
+  last_error = "Bilinmeyen hata"
+
+  # GÖRSEL ANALİZ İÇİN VİZYON MOTORLARI
+  if image_data:
+    vision_messages = list(messages)
+    vision_messages.append({
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    prompt_text
+                    if prompt_text
+                    else "Bu fotoğrafta tam olarak ne var Reis? Detaylı anlat."
+                ),
+            },
+            {"type": "image_url", "image_url": {"url": image_data}},
+        ],
+    })
+
+    v_models = [
+        "llama-3.2-11b-vision-instruct",
+        "llama-3.2-90b-vision-instruct",
+    ]
+    for raw_key in GROQ_API_KEYS:
+      api_key = raw_key.strip()
+      if api_key.startswith("Gsk_"):
+        api_key = "gsk_" + api_key[4:]
+
+      headers = {
+          "Authorization": f"Bearer {api_key}",
+          "Content-Type": "application/json",
+      }
+      for vm in v_models:
+        try:
+          payload = {"model": vm, "messages": vision_messages, "temperature": 0.7}
+          resp = requests.post(url, headers=headers, json=payload, timeout=20)
+          if resp.status_code == 200:
+            data = resp.json()
+            reply = data["choices"][0]["message"]["content"].strip()
+            if "reis" not in reply.lower():
+              reply += " Reis"
+            return reply
+          else:
+            last_error = f"Vizyon API Hatası ({resp.status_code}): {resp.text}"
+            print(last_error)
+        except Exception as e_vis:
+          last_error = str(e_vis)
+          print(f"Vizyon Bağlantı Hatası ({vm}):", e_vis)
+
+  # METİN İÇİN GROQ MOTORLARI (Saf HTTP isteği - Render'da asla takılmaz)
+  engine_pool = [
+      "llama-3.3-70b-versatile",
+      "llama-3.1-8b-instant",
+  ]
+
+  text_p = prompt_text if prompt_text else "Naber Reis?"
+  messages.append({"role": "user", "content": text_p})
+
+  for raw_key in GROQ_API_KEYS:
+    api_key = raw_key.strip()
+    if api_key.startswith("Gsk_"):
+      api_key = "gsk_" + api_key[4:]
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    for model_name in engine_pool:
+      try:
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": 0.7,
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code == 200:
+          data = resp.json()
+          reply = data["choices"][0]["message"]["content"].strip()
+          if "reis" not in reply.lower():
+            reply += " Reis"
+          return reply
+        else:
+          last_error = f"API Hatası ({resp.status_code}): {resp.text}"
+          print(last_error)
+      except Exception as e:
+        last_error = str(e)
+        print(f"Motor Bağlantı Hatası ({model_name}):", e)
+        continue
+
+  return (
+      f"Reis sunucuya bağlanırken şu hatayı aldım: [{last_error}]. Anahtarı"
+      " kontrol edelim kanka!"
+  )
